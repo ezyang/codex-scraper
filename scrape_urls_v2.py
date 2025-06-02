@@ -32,7 +32,14 @@ class CodexTaskScraper:
         """Extract data from a single task page with flexible selectors."""
         try:
             # Wait for content to load
-            await page.wait_for_load_state("networkidle", timeout=30000)
+            try:
+                await page.wait_for_load_state("networkidle", timeout=15000)
+            except:
+                # If networkidle fails, wait for domcontentloaded
+                await page.wait_for_load_state("domcontentloaded", timeout=10000)
+            
+            # Additional wait for dynamic content
+            await page.wait_for_timeout(3000)
             
             # Extract task ID from URL
             task_id = url.split('/')[-1]
@@ -43,15 +50,23 @@ class CodexTaskScraper:
             # Extract prompt - try multiple selectors
             prompt = ""
             prompt_selectors = [
+                # Most specific selectors first
                 'div.px-4.text-sm.break-words.whitespace-pre-wrap',
                 'div[class*="whitespace-pre-wrap"]',
                 'div[class*="break-words"][class*="text-sm"]',
-                # Look for first div that contains substantial text
-                'div:has-text("The") >> nth=0',
+                # Look for task description patterns
+                'div:has-text("The user") >> nth=0',
+                'div:has-text("I need") >> nth=0',
+                'div:has-text("Please") >> nth=0',
+                'div:has-text("Can you") >> nth=0',
                 'div:has-text("Fix") >> nth=0',
                 'div:has-text("Add") >> nth=0',
                 'div:has-text("Update") >> nth=0',
                 'div:has-text("Implement") >> nth=0',
+                'div:has-text("Create") >> nth=0',
+                # General text patterns
+                'p:has-text("The")',
+                'div:has-text("The") >> nth=0',
             ]
             
             for selector in prompt_selectors:
@@ -59,26 +74,38 @@ class CodexTaskScraper:
                     elem = await page.query_selector(selector)
                     if elem:
                         text = await elem.text_content()
-                        # Check if it's likely a prompt (not too short, not navigation)
-                        if text and len(text) > 20 and not any(nav in text.lower() for nav in ['settings', 'environments', 'docs', 'profile']):
+                        # Check if it's likely a prompt
+                        if (text and len(text) > 30 and len(text) < 2000 and 
+                            not any(nav in text.lower() for nav in ['settings', 'environments', 'docs', 'profile', 'codex', 'archived']) and
+                            not text.strip().startswith('⠙')):
                             prompt = text.strip()
+                            logger.info(f"Found prompt using selector: {selector}")
                             break
-                except:
+                except Exception as e:
+                    logger.debug(f"Selector {selector} failed: {e}")
                     continue
             
             if not prompt:
-                # Try to find prompt by structure - it's often the first substantial text block
+                # Try to find prompt by structure - look for main content areas
                 try:
-                    all_divs = await page.query_selector_all('div')
-                    for div in all_divs[:20]:  # Check first 20 divs
-                        text = await div.text_content()
-                        if text and len(text) > 50 and len(text) < 1000:
-                            # Likely a prompt if it's a good length and not code
-                            if not text.startswith('⠙') and not 'KiB' in text:
-                                prompt = text.strip()
+                    # Look for main content containers
+                    main_selectors = ['main', '[role="main"]', '.main-content', '#main']
+                    for main_sel in main_selectors:
+                        main_elem = await page.query_selector(main_sel)
+                        if main_elem:
+                            divs = await main_elem.query_selector_all('div')
+                            for div in divs[:15]:
+                                text = await div.text_content()
+                                if (text and len(text) > 50 and len(text) < 2000 and
+                                    not text.startswith('⠙') and 'KiB' not in text and
+                                    not any(skip in text.lower() for skip in ['navigation', 'menu', 'header', 'footer'])):
+                                    prompt = text.strip()
+                                    logger.info("Found prompt in main content area")
+                                    break
+                            if prompt:
                                 break
-                except:
-                    pass
+                except Exception as e:
+                    logger.debug(f"Main content search failed: {e}")
             
             # Extract metadata with flexible selectors
             metadata = {}
@@ -164,10 +191,27 @@ class CodexTaskScraper:
                 for tab_text in ['Logs', 'Log', 'Output', 'Console']:
                     tab_button = await page.query_selector(f'button:has-text("{tab_text}")')
                     if tab_button:
+                        logger.info(f"Clicking {tab_text} tab")
                         await tab_button.click()
-                        await page.wait_for_timeout(1500)
+                        await page.wait_for_timeout(2000)  # Wait longer for content to load
                         tabs_found = True
                         break
+                
+                if not tabs_found:
+                    # Try alternative tab selectors
+                    alt_selectors = [
+                        'button[role="tab"]:has-text("Log")',
+                        'a:has-text("Log")',
+                        'div[role="tab"]:has-text("Log")',
+                    ]
+                    for selector in alt_selectors:
+                        tab = await page.query_selector(selector)
+                        if tab:
+                            logger.info(f"Found tab with selector: {selector}")
+                            await tab.click()
+                            await page.wait_for_timeout(2000)
+                            tabs_found = True
+                            break
                 
                 # Try multiple selectors for logs container
                 logs_selectors = [
@@ -176,8 +220,16 @@ class CodexTaskScraper:
                     '[role="log"]',
                     'pre',  # Sometimes logs are in pre tags
                     'code',  # Or code blocks
-                    'div:has(code):has-text("Preparing packages")',
+                    'div:has(code):has-text("Preparing")',
                     'div:has-text("Building"):has-text("KiB")',
+                    'div:has-text("npm")',
+                    'div:has-text("yarn")',
+                    'div:has-text("Installing")',
+                    'div:has-text("Compiling")',
+                    # Look for terminal-like output
+                    'div[class*="terminal"]',
+                    'div[class*="console"]',
+                    'div[class*="output"]',
                 ]
                 
                 for selector in logs_selectors:
@@ -188,13 +240,18 @@ class CodexTaskScraper:
                             text_content = await elem.text_content()
                             
                             # Check if it looks like logs
-                            if text_content and ('⠙' in text_content or 'KiB' in text_content or 
-                                               'Building' in text_content or 'error' in text_content.lower() or
-                                               'warning' in text_content.lower() or len(text_content) > 200):
+                            if text_content and (
+                                '⠙' in text_content or 'KiB' in text_content or 
+                                'Building' in text_content or 'error' in text_content.lower() or
+                                'warning' in text_content.lower() or 'npm' in text_content.lower() or
+                                'yarn' in text_content.lower() or 'Installing' in text_content or
+                                'Compiling' in text_content or len(text_content) > 200):
+                                
                                 logs_content = {
                                     'html': html_content,
                                     'text': text_content
                                 }
+                                logger.info(f"Found logs using selector: {selector}")
                                 break
                     except:
                         continue
@@ -310,43 +367,38 @@ class CodexTaskScraper:
                 'scraped_at': datetime.now().isoformat()
             }
     
-    async def scrape_task(self, browser, url: str) -> Dict[str, Any]:
-        """Scrape a single task URL."""
-        context = None
+    async def scrape_task(self, context, url: str) -> Dict[str, Any]:
+        """Scrape a single task URL using existing authenticated context."""
         page = None
         try:
             logger.info(f"Scraping {url}")
             
-            # Create context with specific settings to avoid blocking
-            context = await browser.new_context(
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-                viewport={'width': 1920, 'height': 1080}
-            )
+            # Use existing context to maintain authentication
             page = await context.new_page()
-            
-            # Set extra headers
-            await page.set_extra_http_headers({
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-                'Accept-Language': 'en-US,en;q=0.5',
-                'Accept-Encoding': 'gzip, deflate, br',
-                'DNT': '1',
-                'Connection': 'keep-alive',
-                'Upgrade-Insecure-Requests': '1'
-            })
             
             # Navigate to the URL with retries
             max_retries = 3
             for retry in range(max_retries):
                 try:
                     await page.goto(url, wait_until='domcontentloaded', timeout=30000)
+                    # Wait a bit more for dynamic content
+                    await page.wait_for_timeout(2000)
                     break
                 except Exception as e:
                     if retry < max_retries - 1:
-                        logger.warning(f"Retry {retry + 1} for {url}")
-                        await asyncio.sleep(2)
+                        logger.warning(f"Retry {retry + 1} for {url}: {e}")
+                        await asyncio.sleep(3)
                     else:
                         raise e
             
+            # Check if we actually navigated to the task page
+            current_url = page.url
+            if 'task_e_' not in current_url:
+                logger.warning(f"Navigation may have failed. Current URL: {current_url}")
+                # Try to wait for the page to load properly
+                await page.wait_for_timeout(5000)
+                current_url = page.url
+                
             # Extract data
             data = await self.extract_task_data(page, url)
             
@@ -363,44 +415,52 @@ class CodexTaskScraper:
         finally:
             if page:
                 await page.close()
-            if context:
-                await context.close()
     
     async def scrape_all_tasks(self, urls: List[str]):
-        """Scrape all task URLs with parallel processing."""
+        """Scrape all task URLs using existing authenticated browser context."""
         async with async_playwright() as p:
             # Connect to Chrome via CDP
             browser = await p.chromium.connect_over_cdp("http://localhost:9222")
             
-            # Process URLs in batches
-            results = []
-            for i in range(0, len(urls), self.max_concurrent):
-                batch = urls[i:i + self.max_concurrent]
-                
-                # Create tasks for this batch
-                tasks = [self.scrape_task(browser, url) for url in batch]
-                
-                # Run batch concurrently
-                batch_results = await asyncio.gather(*tasks, return_exceptions=True)
-                
-                # Handle results
-                for result in batch_results:
-                    if isinstance(result, Exception):
-                        logger.error(f"Task failed with exception: {result}")
-                        results.append({
-                            'error': str(result),
-                            'scraped_at': datetime.now().isoformat()
-                        })
-                    else:
-                        results.append(result)
-                
-                logger.info(f"Completed {len(results)}/{len(urls)} tasks")
-                
-                # Small delay between batches
-                if i + self.max_concurrent < len(urls):
-                    await asyncio.sleep(2)
+            # Get the existing authenticated context
+            contexts = browser.contexts
+            if not contexts:
+                logger.error("No browser contexts found. Make sure Chrome is running and you're logged into ChatGPT.")
+                return []
             
-            await browser.close()
+            # Use the first context (should be the authenticated session)
+            context = contexts[0]
+            
+            # Process URLs sequentially to avoid overwhelming the server
+            # and maintain session stability
+            results = []
+            
+            for i, url in enumerate(urls):
+                logger.info(f"Processing {i+1}/{len(urls)}: {url}")
+                
+                try:
+                    result = await self.scrape_task(context, url)
+                    results.append(result)
+                    
+                    # Add delay between requests to be respectful
+                    if i < len(urls) - 1:
+                        await asyncio.sleep(3)
+                        
+                except Exception as e:
+                    logger.error(f"Failed to process {url}: {e}")
+                    results.append({
+                        'url': url,
+                        'task_id': url.split('/')[-1],
+                        'error': str(e),
+                        'scraped_at': datetime.now().isoformat()
+                    })
+                
+                # Log progress every 5 tasks
+                if (i + 1) % 5 == 0:
+                    successful = len([r for r in results if 'error' not in r])
+                    logger.info(f"Progress: {i+1}/{len(urls)} completed, {successful} successful")
+            
+            # Don't close the browser - leave it for the user
             
         return results
     
