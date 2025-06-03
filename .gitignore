@@ -11,3 +11,5 @@ wheels/
 
 codex_tasks/
 codex_urls*
+
+*.png
